@@ -31,10 +31,19 @@ def tokenize_plus(model: HookedTransformer, inputs: List[str], max_length: Optio
     if max_length is not None:
         old_n_ctx = model.cfg.n_ctx
         model.cfg.n_ctx = max_length
-    tokens = model.to_tokens(inputs, prepend_bos=True, padding_side='right', truncate=(max_length is not None))
+    if (("Qwen2.5" in model.cfg.model_name and ("-Instruct" in model.cfg.model_name))
+            or ("Qwen3" in model.cfg.model_name and ("-Base" in model.cfg.model_name))
+            or (model.tokenizer.chat_template is not None)):
+        prepend_bos = False
+        apply_chat_template = True
+    else:
+        prepend_bos = True
+        apply_chat_template = False
+    tokens = model.to_tokens(inputs, prepend_bos=prepend_bos, padding_side='right', truncate=(max_length is not None), apply_chat_template=apply_chat_template)
+
     if max_length is not None:
         model.cfg.n_ctx = old_n_ctx
-    attention_mask = get_attention_mask(model.tokenizer, tokens, True)
+    attention_mask = get_attention_mask(model.tokenizer, tokens, prepend_bos)
     input_lengths = attention_mask.sum(1)
     n_pos = attention_mask.size(1)
     return tokens, attention_mask, input_lengths, n_pos
