@@ -39,7 +39,8 @@ def tokenize_plus(model: HookedTransformer, inputs: List[str], max_length: Optio
     else:
         prepend_bos = True
         apply_chat_template = False
-    tokens = model.to_tokens(inputs, prepend_bos=prepend_bos, padding_side='right', truncate=(max_length is not None), apply_chat_template=apply_chat_template)
+    tokens = model.to_tokens(inputs, prepend_bos=prepend_bos, padding_side='right', truncate=(max_length is not None),
+                             apply_chat_template=apply_chat_template)
 
     if max_length is not None:
         model.cfg.n_ctx = old_n_ctx
@@ -48,7 +49,9 @@ def tokenize_plus(model: HookedTransformer, inputs: List[str], max_length: Optio
     n_pos = attention_mask.size(1)
     return tokens, attention_mask, input_lengths, n_pos
 
-def make_hooks_and_matrices(model: HookedTransformer, graph: Graph, batch_size:int , n_pos:int, scores: Optional[Tensor]):
+
+def make_hooks_and_matrices(model: HookedTransformer, graph: Graph, batch_size: int, n_pos: int,
+                            scores: Optional[Tensor]):
     """Makes a matrix, and hooks to fill it and the score matrix up
 
     Args:
@@ -63,21 +66,23 @@ def make_hooks_and_matrices(model: HookedTransformer, graph: Graph, batch_size:i
     """
     separate_activations = model.cfg.use_normalization_before_and_after and scores is None
     if separate_activations:
-        activation_difference = torch.zeros((2, batch_size, n_pos, graph.n_forward, model.cfg.d_model), device=model.cfg.device, dtype=model.cfg.dtype)
+        activation_difference = torch.zeros((2, batch_size, n_pos, graph.n_forward, model.cfg.d_model),
+                                            device=model.cfg.device_map['embed'], dtype=model.cfg.dtype)
     else:
-        activation_difference = torch.zeros((batch_size, n_pos, graph.n_forward, model.cfg.d_model), device=model.cfg.device, dtype=model.cfg.dtype)
-
+        activation_difference = torch.zeros((batch_size, n_pos, graph.n_forward, model.cfg.d_model),
+                                            device=model.cfg.device_map['embed'], dtype=model.cfg.dtype)
 
     fwd_hooks_clean = []
     fwd_hooks_corrupted = []
     bwd_hooks = []
-        
-    # Fills up the activation difference matrix. In the default case (not separate_activations), 
+
+    # Fills up the activation difference matrix. In the default case (not separate_activations),
     # we add in the corrupted activations (add = True) and subtract out the clean ones (add=False)
-    # In the separate_activations case, we just store them in two halves of the matrix. Less efficient, 
+    # In the separate_activations case, we just store them in two halves of the matrix. Less efficient,
     # but necessary for models with Gemma's architecture.
-    def activation_hook(index, activations, hook, add:bool=True):
+    def activation_hook(index, activations, hook, add: bool = True):
         acts = activations.detach()
+        acts = acts.to(model.cfg.device_map['embed'])
         try:
             if separate_activations:
                 if add:
@@ -92,35 +97,37 @@ def make_hooks_and_matrices(model: HookedTransformer, graph: Graph, batch_size:i
         except RuntimeError as e:
             print(hook.name, activation_difference[:, :, index].size(), acts.size())
             raise e
-    
-    def gradient_hook(prev_index: int, bwd_index: Union[slice, int], gradients:torch.Tensor, hook):
-        """Takes in a gradient and uses it and activation_difference 
+
+    def gradient_hook(prev_index: int, bwd_index: Union[slice, int], gradients: torch.Tensor, hook):
+        """Takes in a gradient and uses it and activation_difference
         to compute an update to the score matrix
 
         Args:
             fwd_index (Union[slice, int]): The forward index of the (src) node
             bwd_index (Union[slice, int]): The backward index of the (dst) node
-            gradients (torch.Tensor): The gradients of this backward pass 
+            gradients (torch.Tensor): The gradients of this backward pass
             hook (_type_): (unused)
 
         """
         grads = gradients.detach()
+        grads = grads.to(model.cfg.device_map['embed'])
         try:
             if grads.ndim == 3:
                 grads = grads.unsqueeze(2)
-            s = einsum(activation_difference[:, :, :prev_index], grads,'batch pos forward hidden, batch pos backward hidden -> forward backward')
+            s = einsum(activation_difference[:, :, :prev_index], grads,
+                       'batch pos forward hidden, batch pos backward hidden -> forward backward')
             s = s.squeeze(1)
             scores[:prev_index, bwd_index] += s
         except RuntimeError as e:
             print(hook.name, activation_difference.size(), activation_difference.device, grads.size(), grads.device)
             print(prev_index, bwd_index, scores.size(), s.size())
             raise e
-    
+
     node = graph.nodes['input']
     fwd_index = graph.forward_index(node)
     fwd_hooks_corrupted.append((node.out_hook, partial(activation_hook, fwd_index)))
     fwd_hooks_clean.append((node.out_hook, partial(activation_hook, fwd_index, add=False)))
-    
+
     for layer in range(graph.cfg['n_layers']):
         node = graph.nodes[f'a{layer}.h0']
         fwd_index = graph.forward_index(node)
@@ -138,12 +145,12 @@ def make_hooks_and_matrices(model: HookedTransformer, graph: Graph, batch_size:i
         fwd_hooks_corrupted.append((node.out_hook, partial(activation_hook, fwd_index)))
         fwd_hooks_clean.append((node.out_hook, partial(activation_hook, fwd_index, add=False)))
         bwd_hooks.append((node.in_hook, partial(gradient_hook, prev_index, bwd_index)))
-        
+
     node = graph.nodes['logits']
     prev_index = graph.prev_index(node)
     bwd_index = graph.backward_index(node)
     bwd_hooks.append((node.in_hook, partial(gradient_hook, prev_index, bwd_index)))
-            
+
     return (fwd_hooks_corrupted, fwd_hooks_clean, bwd_hooks), activation_difference
 
 
@@ -151,10 +158,11 @@ def compute_mean_activations(model: HookedTransformer, graph: Graph, dataloader:
     """
     Compute the mean activations of a graph's nodes over a dataset.
     """
+
     def activation_hook(index, activations, hook, means=None, input_lengths=None):
         # defining a hook that will fill up our means tensor. Means is of shape
         # (n_pos, graph.n_forward, model.cfg.d_model) if per_position is True, otherwise
-        # (graph.n_forward, model.cfg.d_model) 
+        # (graph.n_forward, model.cfg.d_model)
         acts = activations.detach()
 
         # if you gave this hook input lengths, we assume you want to mean over positions
@@ -162,10 +170,10 @@ def compute_mean_activations(model: HookedTransformer, graph: Graph, dataloader:
             mask = torch.zeros_like(activations)
             # mask out all padding positions
             mask[torch.arange(activations.size(0)), input_lengths - 1] = 1
-            
+
             # we need ... because there might be a head index as well
             item_means = einsum(acts, mask, 'batch pos ... hidden, batch pos ... hidden -> batch ... hidden')
-            
+
             # mean over the positions we did take, position-wise
             if len(item_means.size()) == 3:
                 item_means /= input_lengths.unsqueeze(-1).unsqueeze(-1)
@@ -185,7 +193,7 @@ def compute_mean_activations(model: HookedTransformer, graph: Graph, dataloader:
             if node.layer in processed_attn_layers:
                 continue
             processed_attn_layers.add(node.layer)
-        
+
         if not isinstance(node, LogitNode):
             hook_points_indices.append((node.out_hook, graph.forward_index(node)))
 
@@ -207,7 +215,8 @@ def compute_mean_activations(model: HookedTransformer, graph: Graph, dataloader:
 
         if per_position:
             input_lengths = None
-        add_to_mean_hooks = [(hook_point, partial(activation_hook, index, means=means, input_lengths=input_lengths)) for hook_point, index in hook_points_indices]
+        add_to_mean_hooks = [(hook_point, partial(activation_hook, index, means=means, input_lengths=input_lengths)) for
+                             hook_point, index in hook_points_indices]
 
         with model.hooks(fwd_hooks=add_to_mean_hooks):
             model(tokens, attention_mask=attention_mask)
